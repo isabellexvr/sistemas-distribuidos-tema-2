@@ -48,7 +48,14 @@ load_dotenv()
 
 DEFAULT_BURSTS = [1, 5, 10, 25, 50, 100, 200, 500]
 DEFAULT_PAUSE_S = 30
+WARMUP_MIN_PAUSE_S = 10
 LOG_PATH = 'results/raw.jsonl'
+
+# Erros 5xx do Lambda que são falha transitória do serviço (viram linha `server_error`). Os demais 5xx
+# modelados (InvalidZipFileException, ResourceNotReadyException, KMS*, ENI*, Subnet*...) indicam função
+# quebrada ou mal configurada e interrompem a série. 5xx sem código modelado (ex.: 503 de balanceador)
+# também viram `server_error`.
+_TRANSIENT_5XX = {'ServiceException', 'EC2ThrottledException', 'EC2UnexpectedException'}
 
 # Linha REPORT do log (texto) e o equivalente no formato JSON de log da Lambda
 _REPORT_TEXT = {
@@ -126,6 +133,7 @@ def _row(payload, elapsed_ms, **fields) -> dict:
         'payload_sent': payload,
         'outcome': None,
         'reason': None,
+        'error_code': None,
         'retry_attempts': None,
         'report_found': None,
         'duration_ms': None,
@@ -140,10 +148,12 @@ def invoke_once(client, function_name: str, payload: dict) -> dict:
     """
     Uma única tentativa de invocação. Classificação em `outcome`:
     - 'ok' / 'function_error' (a função executou; os dois são HTTP 200);
-    - 'throttled': HTTP 429, com `reason` (ex.: ConcurrentInvocationLimitExceeded);
-    - 'server_error': HTTP 5xx;
+    - 'throttled': HTTP 429, com `reason` quando a AWS informa o motivo (ex.: ConcurrentInvocationLimitExceeded,
+      FunctionInvocationRateLimitExceeded); senão `reason` fica None e o código vai em `error_code`;
+    - 'server_error': HTTP 5xx transitório (ServiceException, EC2Throttled/Unexpected ou 5xx sem código modelado);
     - 'timeout' / 'network': o cliente não recebeu a resposta.
-    Outros 4xx (função ou região erradas, permissão) e falta de credenciais propagam: a série para.
+    Outros 4xx (função ou região erradas, permissão), 5xx de função quebrada ou mal configurada
+    (InvalidZipFileException, ResourceNotReadyException...) e falta de credenciais propagam: a série para.
     """
     body_bytes = json.dumps(payload).encode('utf-8')
     start = time.perf_counter()
@@ -156,18 +166,23 @@ def invoke_once(client, function_name: str, payload: dict) -> dict:
         meta = e.response.get('ResponseMetadata', {})
         err = e.response.get('Error', {})
         status = meta.get('HTTPStatusCode')
+        code = err.get('Code')
         if status == 429:
             outcome = 'throttled'
-        elif (status or 0) >= 500:
+        elif (status or 0) >= 500 and (
+            code in _TRANSIENT_5XX
+            or code not in {s.name for s in client.meta.service_model.error_shapes}
+        ):
             outcome = 'server_error'
         else:
-            raise
+            raise  # erro de configuração/permissão ou função quebrada: não é medição
         return _row(
             payload, elapsed_ms,
             outcome=outcome,
             status_code=status,
             error=err.get('Message') or str(e),
-            reason=e.response.get('Reason') or err.get('Code'),
+            reason=e.response.get('Reason'),
+            error_code=code,
             request_id=meta.get('RequestId'),
             retry_attempts=meta.get('RetryAttempts'),
         )
@@ -178,6 +193,7 @@ def invoke_once(client, function_name: str, payload: dict) -> dict:
             payload, elapsed_ms,
             outcome='timeout' if timed_out else 'network',
             error=f'{type(e).__name__}: {e}',
+            error_code=type(e).__name__,
         )
 
     meta = response.get('ResponseMetadata', {})
@@ -193,6 +209,7 @@ def invoke_once(client, function_name: str, payload: dict) -> dict:
         outcome=outcome,
         status_code=response.get('StatusCode'),
         error=error,
+        error_code=response.get('FunctionError'),
         request_id=meta.get('RequestId'),
         retry_attempts=meta.get('RetryAttempts'),
         payload_received=body,
@@ -229,8 +246,28 @@ def run_burst(function_name: str, size: int, rnd: int, run_id: str, invoke_fn, s
 
     with ThreadPoolExecutor(max_workers=size) as executor:
         futures = [executor.submit(call, i) for i in range(size)]
-        # f.result() repassa erros de configuração (4xx, credenciais) e interrompe a série
-        return [f.result() for f in futures]
+
+    # Erros de configuração (4xx, função quebrada, credenciais) interrompem a série, mas as linhas das
+    # chamadas que deram resultado nesta rajada vão junto na exceção para serem gravadas antes
+    rows, first_error = [], None
+    for f in futures:
+        try:
+            rows.append(f.result())
+        except Exception as e:  # noqa: BLE001 — repassado logo abaixo
+            if first_error is None:
+                first_error = e
+    if first_error is not None:
+        raise BurstError(rows, first_error) from first_error
+    return rows
+
+
+class BurstError(Exception):
+    """Uma chamada da rajada levantou erro; `rows` tem as linhas das chamadas que deram resultado."""
+
+    def __init__(self, rows: list, error: Exception):
+        super().__init__(f'{type(error).__name__}: {error}')
+        self.rows = rows
+        self.error = error
 
 
 def _fmt(values) -> str:
@@ -270,7 +307,8 @@ def summarize(rows: list) -> dict:
     reasons = {}
     for r in rows:
         if r['outcome'] == 'throttled':
-            reasons[r['reason']] = reasons.get(r['reason'], 0) + 1
+            key = r['reason'] or f"sem motivo ({r.get('error_code')})"
+            reasons[key] = reasons.get(key, 0) + 1
 
     ok = [r for r in rows if r['outcome'] == 'ok']
     cold = [r for r in ok if r['report_found'] and r['init_duration_ms'] is not None]
@@ -331,7 +369,14 @@ def run(function_name: str, bursts: list, rounds: int, pause_s: float, invoke_fn
     for rnd in range(1, rounds + 1):
         for idx, size in enumerate(bursts):
             print(f"\n[rodada {rnd}/{rounds}] rajada de {size} chamadas simultâneas...")
-            rows = run_burst(function_name, size, rnd, run_id, invoke_fn)
+            try:
+                rows = run_burst(function_name, size, rnd, run_id, invoke_fn)
+            except BurstError as e:
+                for r in e.rows:
+                    save_log(r, log_path)
+                print(f"  ERRO: rajada interrompida por {type(e.error).__name__}; "
+                      f"{len(e.rows)} de {size} linha(s) gravada(s). Série encerrada.")
+                raise e.error
             for r in rows:
                 save_log(r, log_path)
             s = summarize(rows)
@@ -379,7 +424,10 @@ def warm_up(function_name: str, size: int, run_id: str, invoke_fn) -> dict:
     no mesmo estado. As chamadas acima do limite de concorrência sofrem throttle e não executam.
     """
     print(f"Aquecimento: rajada de {size} chamadas para abrir as conexões (não gravada)...")
-    s = summarize(run_burst(function_name, size, 0, run_id, invoke_fn, serie='warmup'))
+    try:
+        s = summarize(run_burst(function_name, size, 0, run_id, invoke_fn, serie='warmup'))
+    except BurstError as e:
+        raise e.error  # o aquecimento não é gravado; só interrompe
     print(f"  {s['counts']}")
     return s
 
@@ -445,11 +493,11 @@ def main(argv=None):
 
     invoke_fn = lambda fn, payload: invoke_once(client, fn, payload)
     warm_up(function_name, max(args.bursts), run_id, invoke_fn)
-    if args.pause > 0:
-        # O aquecimento grande estoura o limite de taxa de invocações; sem pausa, a primeira rajada
-        # medida é rejeitada por FunctionInvocationRateLimitExceeded (run 20261121T020624Z)
-        print(f"  pausando {args.pause:.0f}s depois do aquecimento...")
-        time.sleep(args.pause)
+    # O aquecimento grande estoura o limite de taxa de invocações; sem pausa, a primeira rajada medida é
+    # rejeitada por FunctionInvocationRateLimitExceeded (run 20261121T020624Z). A pausa vale mesmo com --pause 0.
+    post_warmup = max(args.pause, WARMUP_MIN_PAUSE_S)
+    print(f"  pausando {post_warmup:.0f}s depois do aquecimento...")
+    time.sleep(post_warmup)
 
     print(f"Série THROTTLE {run_id}: rajadas {args.bursts}, {args.rounds} rodada(s), pausa {args.pause:.0f}s")
     run(function_name, args.bursts, args.rounds, args.pause, invoke_fn, run_id)
