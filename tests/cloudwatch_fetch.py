@@ -2,17 +2,8 @@
 Enriquece results/raw.jsonl com as métricas internas que a Lambda grava no CloudWatch Logs.
 
 Para cada chamada que executou, busca no log group /aws/lambda/<FUNCTION_NAME> a linha
-"REPORT RequestId: ..." e extrai Init Duration (só em cold starts), Duration e Max Memory Used.
-Salva tudo em results/enriched.jsonl, que é a entrada do analyze.py.
-
-Cuidados em relação ao esboço do PDF:
-- `Duration` é lido com regex ancorada; o teste por substring também casava com `Billed Duration`,
-  que vem depois na linha e sobrescrevia o valor;
-- linhas que não executaram (throttle 429, erro de rede, sem request_id) não são consultadas:
-  não existe REPORT para elas;
-- valores que a linha já trouxe da própria invocação (ex.: série de throttle, que lê o REPORT com
-  LogType='Tail') não são apagados: o CloudWatch só preenche campos vazios;
-- a busca é limitada a uma janela de tempo em volta de `sent_at` e segue a paginação (`nextToken`).
+"REPORT RequestId: ..." e extrai Init Duration (só em cold starts), Duration,
+Billed Duration e Max Memory Used. Salva tudo em results/enriched.jsonl.
 
 Uso (da raiz do repo, depois de rodar alguma série):
     python -m tests.cloudwatch_fetch
@@ -32,7 +23,7 @@ load_dotenv()
 INPUT_PATH = 'results/raw.jsonl'
 OUTPUT_PATH = 'results/enriched.jsonl'
 SLEEP_BETWEEN_CALLS_S = 0.1           # para não estourar o limite de chamadas do CloudWatch Logs
-WINDOW_BEFORE = timedelta(minutes=5)  # janela de busca em volta de sent_at
+WINDOW_BEFORE = timedelta(minutes=5)
 WINDOW_AFTER = timedelta(minutes=30)
 MAX_PAGES = 20
 
@@ -143,7 +134,7 @@ def merge_metrics(row: dict, metrics: dict) -> dict:
     merged = dict(row)
     for field in METRIC_FIELDS:
         if merged.get(field) is None:
-            merged[field] = metrics.get(field)  # todos os campos presentes, None se o CloudWatch não trouxe
+            merged[field] = metrics.get(field)
     merged['cloudwatch_error'] = metrics.get('cloudwatch_error')
     return merged
 
