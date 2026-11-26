@@ -1,0 +1,28 @@
+{
+  "run_id": "20261121T021656Z",
+  "region": "sa-east-1",
+  "function_name": "tema2-light-heliojoserr",
+  "account_concurrent_executions": 10,
+  "account_unreserved_concurrent_executions": 10,
+  "function_reserved_concurrent_executions": null,
+  "memory_mb": 256,
+  "timeout_s": 10,
+  "runtime": "python3.12",
+  "bursts": [
+    1,
+    5,
+    8,
+    10,
+    12,
+    15,
+    20,
+    25,
+    50,
+    100,
+    200,
+    500
+  ],
+  "rounds": 1,
+  "pause_s": 30,
+  "boto3_version": "1.44.8"
+}
